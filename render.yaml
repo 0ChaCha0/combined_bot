@@ -1,0 +1,54 @@
+services:
+  - type: web
+    name: 5-bots-combined
+    env: docker
+    region: frankfurt
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      # --- Общие переменные ---
+      - key: ADMIN_USER_ID
+        value: "8430203469"
+      - key: AI_API_KEY
+        sync: false  # секрет — вводи в Render dashboard
+      - key: AI_BASE_URL
+        value: https://api.groq.com/openai/v1
+      - key: AI_MODEL
+        value: openai/gpt-oss-20b
+
+      # --- Бот A: КрасNEWs ---
+      - key: BOT_A_TOKEN
+        sync: false  # секрет
+      - key: BOT_A_CHANNEL
+        value: "-1003716356388"
+
+      # --- Бот B: КРСК Вакансии ---
+      - key: BOT_B_TOKEN
+        sync: false  # секрет
+      - key: BOT_B_CHANNEL
+        value: "-1004351027911"
+
+      # --- Бот C: Тайны зодиака ---
+      - key: BOT_C_TOKEN
+        sync: false  # секрет
+      - key: BOT_C_CHANNEL
+        value: "-1004495766226"
+
+      # --- Бот D: ИИ даром ---
+      - key: BOT_D_TOKEN
+        sync: false  # секрет
+      - key: BOT_D_CHANNEL
+        value: "-1003931743105"
+
+      # --- Бот E: AI Дайджест ---
+      - key: BOT_E_TOKEN
+        sync: false  # секрет — ВВЕДИ СВОЙ ТОКЕН в Render dashboard
+      - key: BOT_E_CHANNEL
+        sync: false  # секрет — ВВЕДИ СВОЙ CHANNEL_ID в Render dashboard
+
+      # --- Системные ---
+      - key: TZ
+        value: Europe/Moscow
+      - key: PYTHONUNBUFFERED
+        value: "1"
