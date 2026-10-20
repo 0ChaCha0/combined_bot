@@ -71,6 +71,7 @@ TELEGRAM_CHANNEL_ID = os.environ.get('TELEGRAM_CHANNEL_ID', '')
 ADMIN_USER_ID = os.environ.get('ADMIN_USER_ID', '')
 PROXY_URL = os.environ.get('PROXY_URL', '').strip()
 ENABLE_IMAGES = os.environ.get('ENABLE_IMAGES', 'true').lower() == 'true'
+ENABLE_PREVIEW = os.environ.get('ENABLE_PREVIEW', 'true').lower() == 'true'
 IMAGE_SOURCE = os.environ.get('IMAGE_SOURCE', 'both').lower()
 IMAGE_WIDTH = int(os.environ.get('IMAGE_WIDTH', '1024'))
 IMAGE_HEIGHT = int(os.environ.get('IMAGE_HEIGHT', '576'))

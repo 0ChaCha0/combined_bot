@@ -205,6 +205,7 @@ AI_DISABLED = False
 
 def generate_morning_horoscope():
     """Утренний гороскоп на день для всех 12 знаков."""
+    global AI_FAILURE_COUNT, AI_DISABLED
     if not AI_API_KEY or AI_DISABLED:
         return format_fallback_horoscope('morning')
 
@@ -278,6 +279,7 @@ IMAGE_PROMPT: mystic astrology background with zodiac symbols, moon, stars, deep
 
 def generate_love_horoscope():
     """Гороскоп любви."""
+    global AI_FAILURE_COUNT, AI_DISABLED
     if not AI_API_KEY or AI_DISABLED:
         return format_fallback_horoscope('love'), 'love heart mystic background'
 
@@ -336,6 +338,7 @@ IMAGE_PROMPT: romantic heart zodiac, mystic love, pink and gold accents, etherea
 
 def generate_evening_summary():
     """Вечерний итог дня."""
+    global AI_FAILURE_COUNT, AI_DISABLED
     if not AI_API_KEY or AI_DISABLED:
         return format_fallback_horoscope('evening'), 'evening stars mystic'
 
