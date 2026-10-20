@@ -131,21 +131,47 @@ def update_env_var(key, value):
     except Exception as e:
         return False
 
-# === HH.RU API ПАРСИНГ ===
+# === HH.RU ПАРСИНГ ВАКАНСИЙ ===
+# ВАЖНО: area=72 в HH.ru — это Пермь! Не Красноярск.
+# Правильные ID:
+#   area=54    — Красноярск (город)
+#   area=1146 — Красноярский край (весь регион, включая пригороды)
+# По умолчанию берём весь край — больше вакансий.
+KRASNOYARSK_AREA = os.environ.get('HH_AREA', '1146')  # 1146 — Красноярский край
+
+VACANCY_CATEGORIES = [
+    {'key': 'IT',          'text': 'IT',          'emoji': '💻', 'hh_text': 'IT OR программист OR разработчик'},
+    {'key': 'SALES',       'text': 'Продажи',      'emoji': '💼', 'hh_text': 'продажи OR менеджер по продажам'},
+    {'key': 'MARKETING',   'text': 'Маркетинг',     'emoji': '📢', 'hh_text': 'маркетинг OR SMM OR PR'},
+    {'key': 'LOGISTIC',    'text': 'Логистика',     'emoji': '🚚', 'hh_text': 'логист OR кладовщик OR водитель'},
+    {'key': 'FINANCE',     'text': 'Финансы',       'emoji': '💰', 'hh_text': 'бухгалтер OR финансы OR экономист'},
+    {'key': 'HR',          'text': 'HR',            'emoji': '🤝', 'hh_text': 'HR OR рекрутер OR кадры'},
+    {'key': 'ENGINEER',    'text': 'Инженеры',      'emoji': '⚙️', 'hh_text': 'инженер OR конструктор OR технолог'},
+    {'key': 'ADMIN',       'text': 'Администраторы','emoji': '📋', 'hh_text': 'администратор OR секретарь OR делопроизводитель'},
+]
 
 def fetch_hh_vacancies():
-    """Получить вакансии через HH.ru API (area=72 — Красноярск)."""
-    all_vacancies = []
-    # Пробуем разные категории для разнообразия
-    categories_to_fetch = random.sample(VACANCY_CATEGORIES, min(3, len(VACANCY_CATEGORIES)))
+    """Получить вакансии через HH.ru. Сначала пробуем официальный API;
+    если он заблокирован по IP (DDoS-Guard часто бьёт по cloud-серверам),
+    падаем на парсинг HTML-страницы поиска вакансий."""
+    # Сначала пробуем API (работает только с «обычных» IP)
+    vacancies = _fetch_hh_via_api()
+    if vacancies:
+        return vacancies
+    # Если API вернул 0 — пробуем парсить HTML
+    logger.warning("⚠️ HH.ru API вернул 0 (вероятно заблокирован по IP). Падаю на HTML-парсинг.")
+    return _fetch_hh_via_html()
 
+def _fetch_hh_via_api():
+    """Официальный HH.ru API. Работает не со всех IP (Cloudflare/DDoS-Guard)."""
+    all_vacancies = []
+    categories_to_fetch = random.sample(VACANCY_CATEGORIES, min(3, len(VACANCY_CATEGORIES)))
     for cat in categories_to_fetch:
         try:
-            # HH.ru API: area=72 = Красноярск
             url = "https://api.hh.ru/vacancies"
             params = {
-                'area': '72',  # Красноярск
-                'text': cat['text'],
+                'area': KRASNOYARSK_AREA,  # Красноярский край (1146) или город (54)
+                'text': cat['hh_text'],
                 'per_page': '10',
                 'page': '0',
                 'order_by': 'publication_time',
@@ -153,11 +179,18 @@ def fetch_hh_vacancies():
                 'only_with_salary': 'false',
             }
             headers = {
-                'User-Agent': 'KrasnoyarskJobsBot/1.0 (contact: admin@example.com)',
+                'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0',
                 'Accept': 'application/json',
+                'Accept-Language': 'ru-RU,ru;q=0.9',
             }
             r = requests.get(url, params=params, headers=headers, timeout=15, proxies=get_proxies())
+            if r.status_code != 200:
+                logger.warning(f"HH API {cat['text']}: HTTP {r.status_code} — {r.text[:200]}")
+                continue
             data = r.json()
+            if isinstance(data, dict) and data.get('errors'):
+                logger.warning(f"HH API {cat['text']}: HH вернул ошибку {data['errors']}")
+                continue
             for item in data.get('items', []):
                 vacancy = {
                     'title': item.get('name', 'Вакансия'),
@@ -171,16 +204,151 @@ def fetch_hh_vacancies():
                     'category': cat['text'],
                     'category_emoji': cat['emoji'],
                     'image_url': item.get('employer', {}).get('logo_urls', {}).get('240x240') if item.get('employer') else None,
-                    'source': 'hh.ru',
+                    'source': 'hh.ru API',
                 }
                 all_vacancies.append(vacancy)
             logger.info(f"📥 {cat['text']}: получено {len(data.get('items', []))} вакансий")
             time.sleep(1)  # вежливость к API
         except Exception as e:
-            logger.error(f"HH.ru {cat['text']}: {e}")
-
-    logger.info(f"📦 Всего вакансий: {len(all_vacancies)}")
+            logger.error(f"HH API {cat['text']}: {e}")
+    logger.info(f"📦 Всего через API: {len(all_vacancies)} вакансий")
     return all_vacancies
+
+def _fetch_hh_via_html():
+    """Фолбэк: парсинг HTML-страницы поиска вакансий krasnoyarsk.hh.ru.
+    Медленнее, но работает даже когда API заблокирован."""
+    import re as _re
+    from html import unescape
+    all_vacancies = []
+    categories_to_fetch = random.sample(VACANCY_CATEGORIES, min(3, len(VACANCY_CATEGORIES)))
+    for cat in categories_to_fetch:
+        try:
+            url = "https://krasnoyarsk.hh.ru/search/vacancy"
+            params = {
+                'area': KRASNOYARSK_AREA,
+                'text': cat['hh_text'],
+                'search_field': 'name',
+                'order_by': 'publication_time',
+                'per_page': '10',
+                'page': '0',
+            }
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'ru-RU,ru;q=0.9,en;q=0.5',
+            }
+            r = requests.get(url, params=params, headers=headers, timeout=20, proxies=get_proxies())
+            if r.status_code != 200:
+                logger.warning(f"HH HTML {cat['text']}: HTTP {r.status_code}")
+                continue
+            html = r.text
+            # HH отдаёт вакансии в JSON-LD блоке (JobPosting) — это самый стабильный способ парсинга
+            # Если JSON-LD нет — ищем data-qa атрибуты.
+            count = 0
+            # Метод 1: JSON-LD JobPosting (приоритет)
+            for m in _re.finditer(r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>', html, _re.DOTALL):
+                try:
+                    import json as _json
+                    block = _json.loads(m.group(1))
+                    if isinstance(block, list):
+                        for jp in block:
+                            if isinstance(jp, dict) and jp.get('@type') == 'JobPosting':
+                                all_vacancies.append(_vacancy_from_jsonld(jp, cat))
+                                count += 1
+                    elif isinstance(block, dict) and block.get('@type') == 'JobPosting':
+                        all_vacancies.append(_vacancy_from_jsonld(block, cat))
+                        count += 1
+                except Exception:
+                    continue
+            # Метод 2: data-qa="serp-item__title-text" — вытащить ссылки и названия
+            if count == 0:
+                for m in _re.finditer(
+                    r'<a[^>]+data-qa="serp-item__title"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+                    html, _re.DOTALL,
+                ):
+                    link = unescape(m.group(1))
+                    title = _re.sub(r'<[^>]+>', '', m.group(2)).strip()
+                    title = unescape(title)
+                    if link and title:
+                        all_vacancies.append({
+                            'title': title[:200],
+                            'link': link,
+                            'employer': _extract_employer_from_html(html, link),
+                            'salary': 'не указана',
+                            'type': '',
+                            'schedule': '',
+                            'snippet': '',
+                            'published': '',
+                            'category': cat['text'],
+                            'category_emoji': cat['emoji'],
+                            'image_url': None,
+                            'source': 'hh.ru HTML',
+                        })
+                        count += 1
+            logger.info(f"📥 HTML {cat['text']}: получено {count} вакансий")
+            time.sleep(1)
+        except Exception as e:
+            logger.error(f"HH HTML {cat['text']}: {e}")
+    logger.info(f"📦 Всего через HTML: {len(all_vacancies)} вакансий")
+    return all_vacancies
+
+def _vacancy_from_jsonld(jp, cat):
+    """Преобразовать JSON-LD JobPosting в стандартный словарь вакансии."""
+    import re as _re
+    link = jp.get('url') or jp.get('@id') or ''
+    title = jp.get('title', 'Вакансия')
+    employer = jp.get('hiringOrganization', {}).get('name', 'Компания')
+    loc = jp.get('jobLocation', {})
+    if isinstance(loc, list) and loc:
+        loc = loc[0]
+    salary = 'не указана'
+    s = jp.get('baseSalary', {})
+    if isinstance(s, dict):
+        cur = s.get('currency', 'RUB')
+        cur_sym = {'RUB': '₽', 'USD': '$', 'EUR': '€'}.get(cur, cur)
+        mn = s.get('minValue')
+        mx = s.get('maxValue')
+        if mn and mx:
+            salary = f"{mn}-{mx} {cur_sym}"
+        elif mn:
+            salary = f"от {mn} {cur_sym}"
+        elif mx:
+            salary = f"до {mx} {cur_sym}"
+    snippet = jp.get('description', '')[:500]
+    snippet = _re.sub(r'<[^>]+>', '', snippet)  # убрать HTML
+    published = jp.get('datePosted', '')
+    return {
+        'title': title[:200],
+        'link': link,
+        'employer': employer,
+        'salary': salary,
+        'type': '',
+        'schedule': '',
+        'snippet': snippet,
+        'published': published,
+        'category': cat['text'],
+        'category_emoji': cat['emoji'],
+        'image_url': None,
+        'source': 'hh.ru HTML',
+    }
+
+def _extract_employer_from_html(html, vacancy_link):
+    """Попытаться вытащить название работодателя из HTML рядом со ссылкой."""
+    import re as _re
+    from html import unescape
+    try:
+        # Ищем работодателя после ссылки на вакансию
+        idx = html.find(vacancy_link)
+        if idx < 0:
+            return 'Компания'
+        # В пределах 2000 символов после ссылки
+        window = html[idx:idx+2000]
+        m = _re.search(r'data-qa="vacancy-serp__vacancy-employer"[^>]*>(?:<a[^>]*>)?([^<]+)', window)
+        if m:
+            return unescape(m.group(1).strip()) or 'Компания'
+    except Exception:
+        pass
+    return 'Компания'
 
 def format_salary(salary_data):
     """Форматировать зарплату в читаемый вид."""
@@ -213,12 +381,14 @@ def is_ai_related(article):
     return True  # все вакансии релевантны для канала вакансий
 
 def filter_fresh_articles(articles, hours=48):
-    """Только свежие вакансии (последние 48 часов)."""
+    """Только свежие вакансии (последние 48 часов).
+    Если дата публикации неизвестна (HTML-парсинг без JSON-LD) — считаем свежей."""
     now = datetime.now()
     fresh = []
     for art in articles:
         published = art.get('published', '')
         if not published:
+            fresh.append(art)
             continue
         try:
             # HH.ru формат: 2024-01-15T10:30:00+0300
@@ -397,47 +567,69 @@ def get_post_image(article):
 
 def send_to_telegram(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHANNEL_ID:
+        logger.error("send_to_telegram: нет TELEGRAM_BOT_TOKEN или TELEGRAM_CHANNEL_ID")
         return False
     if len(text) > 4096:
         text = text[:4090] + '...'
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {'chat_id': TELEGRAM_CHANNEL_ID, 'text': text, 'parse_mode': 'HTML'}
+    last_err = ''
     for attempt in range(3):
         try:
             r = requests.post(url, json=payload, timeout=30, proxies=get_proxies())
             data = r.json()
             if data.get('ok'):
                 return True
-            if 'parse' in str(data.get('description', '')).lower():
+            desc = str(data.get('description', ''))
+            err_code = data.get('error_code', '')
+            last_err = f"{err_code} {desc}"
+            if 'parse' in desc.lower() or 'can\'t find end of' in desc.lower() or 'tag' in desc.lower():
                 payload['parse_mode'] = ''
                 continue
+            if 'chat not found' in desc.lower() or 'forbidden' in desc.lower() or 'not enough rights' in desc.lower() or 'chat deactivated' in desc.lower():
+                logger.error(f"send_to_telegram: Telegram отказал (chat={TELEGRAM_CHANNEL_ID}): {last_err}. Бот не админ в канале или неверный channel_id.")
+                return False
+            logger.warning(f"send_to_telegram {attempt+1}/3: {last_err}")
             time.sleep(5 * (attempt + 1))
         except Exception as e:
+            last_err = str(e)
             logger.error(f"send {attempt+1}/3: {e}")
             time.sleep(5 * (attempt + 1))
+    logger.error(f"send_to_telegram: не удалось после 3 попыток. Последняя ошибка: {last_err}")
     return False
 
 def send_photo_to_telegram(image_bytes, caption):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHANNEL_ID:
+        logger.error("send_photo_to_telegram: нет TELEGRAM_BOT_TOKEN или TELEGRAM_CHANNEL_ID")
         return False
     caption = caption[:1020] + '...' if len(caption) > 1024 else caption
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     files = {'photo': ('image.jpg', image_bytes, 'image/jpeg')}
     data = {'chat_id': TELEGRAM_CHANNEL_ID, 'caption': caption, 'parse_mode': 'HTML'}
+    last_err = ''
     for attempt in range(3):
         try:
             r = requests.post(url, files=files, data=data, timeout=90, proxies=get_proxies())
             result = r.json()
             if result.get('ok'):
                 return True
-            if 'parse' in str(result.get('description', '')).lower():
+            desc = str(result.get('description', ''))
+            err_code = result.get('error_code', '')
+            last_err = f"{err_code} {desc}"
+            if 'parse' in desc.lower():
                 data['parse_mode'] = ''
                 files = {'photo': ('image.jpg', image_bytes, 'image/jpeg')}
                 continue
+            if 'chat not found' in desc.lower() or 'forbidden' in desc.lower() or 'not enough rights' in desc.lower() or 'chat deactivated' in desc.lower():
+                logger.error(f"send_photo_to_telegram: Telegram отказал (chat={TELEGRAM_CHANNEL_ID}): {last_err}. Проверь, что бот — админ канала с правом 'Post Messages'.")
+                return False
+            logger.warning(f"send_photo {attempt+1}/3: {last_err}")
             time.sleep(5 * (attempt + 1))
         except Exception as e:
+            last_err = str(e)
             logger.error(f"send_photo {attempt+1}/3: {e}")
             time.sleep(5 * (attempt + 1))
+    logger.error(f"send_photo_to_telegram: не удалось после 3 попыток. Последняя ошибка: {last_err}")
     return False
 
 def send_message_to_admin(text, reply_markup=None):

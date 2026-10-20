@@ -204,10 +204,10 @@ AI_FAILURE_COUNT = 0
 AI_DISABLED = False
 
 def generate_morning_horoscope():
-    """Утренний гороскоп на день для всех 12 знаков."""
+    """Утренний гороскоп на день для всех 12 знаков. Возвращает (text, image_prompt)."""
     global AI_FAILURE_COUNT, AI_DISABLED
     if not AI_API_KEY or AI_DISABLED:
-        return format_fallback_horoscope('morning')
+        return format_fallback_horoscope('morning'), 'mystic astrology background, zodiac, gold'
 
     today = datetime.now().strftime('%d %B %Y')
     moon_phase, moon_emoji = get_moon_phase()
@@ -278,7 +278,7 @@ IMAGE_PROMPT: mystic astrology background with zodiac symbols, moon, stars, deep
     return format_fallback_horoscope('morning'), 'mystic astrology background, zodiac, gold'
 
 def generate_love_horoscope():
-    """Гороскоп любви."""
+    """Гороскоп любви. Возвращает (text, image_prompt)."""
     global AI_FAILURE_COUNT, AI_DISABLED
     if not AI_API_KEY or AI_DISABLED:
         return format_fallback_horoscope('love'), 'love heart mystic background'
@@ -337,7 +337,7 @@ IMAGE_PROMPT: romantic heart zodiac, mystic love, pink and gold accents, etherea
     return format_fallback_horoscope('love'), 'romantic heart zodiac'
 
 def generate_evening_summary():
-    """Вечерний итог дня."""
+    """Вечерний итог дня. Возвращает (text, image_prompt)."""
     global AI_FAILURE_COUNT, AI_DISABLED
     if not AI_API_KEY or AI_DISABLED:
         return format_fallback_horoscope('evening'), 'evening stars mystic'
@@ -443,47 +443,72 @@ def get_post_image(image_prompt):
 
 def send_to_telegram(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHANNEL_ID:
+        logger.error("send_to_telegram: нет TELEGRAM_BOT_TOKEN или TELEGRAM_CHANNEL_ID")
         return False
     if len(text) > 4096:
         text = text[:4090] + '...'
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {'chat_id': TELEGRAM_CHANNEL_ID, 'text': text, 'parse_mode': 'HTML'}
+    last_err = ''
     for attempt in range(3):
         try:
             r = requests.post(url, json=payload, timeout=30, proxies=get_proxies())
             data = r.json()
             if data.get('ok'):
                 return True
-            if 'parse' in str(data.get('description', '')).lower():
+            desc = str(data.get('description', ''))
+            err_code = data.get('error_code', '')
+            last_err = f"{err_code} {desc}"
+            # Если HTML-парсинг — повторяем без parse_mode
+            if 'parse' in desc.lower() or 'can\'t find end of' in desc.lower() or 'tag' in desc.lower():
                 payload['parse_mode'] = ''
                 continue
+            # Чат не найден / нет прав — повторять бесполезно, выходим сразу
+            if 'chat not found' in desc.lower() or 'forbidden' in desc.lower() or 'not enough rights' in desc.lower() or 'chat deactivated' in desc.lower():
+                logger.error(f"send_to_telegram: Telegram отказал (chat={TELEGRAM_CHANNEL_ID}): {last_err}. Бот не админ в канале или неверный channel_id.")
+                return False
+            logger.warning(f"send_to_telegram {attempt+1}/3: {last_err}")
             time.sleep(5 * (attempt + 1))
         except Exception as e:
+            last_err = str(e)
             logger.error(f"send {attempt+1}/3: {e}")
             time.sleep(5 * (attempt + 1))
+    logger.error(f"send_to_telegram: не удалось после 3 попыток. Последняя ошибка: {last_err}")
     return False
 
 def send_photo_to_telegram(image_bytes, caption):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHANNEL_ID:
+        logger.error("send_photo_to_telegram: нет TELEGRAM_BOT_TOKEN или TELEGRAM_CHANNEL_ID")
         return False
     caption = caption[:1020] + '...' if len(caption) > 1024 else caption
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     files = {'photo': ('image.jpg', image_bytes, 'image/jpeg')}
     data = {'chat_id': TELEGRAM_CHANNEL_ID, 'caption': caption, 'parse_mode': 'HTML'}
+    last_err = ''
     for attempt in range(3):
         try:
             r = requests.post(url, files=files, data=data, timeout=90, proxies=get_proxies())
             result = r.json()
             if result.get('ok'):
                 return True
-            if 'parse' in str(result.get('description', '')).lower():
+            desc = str(result.get('description', ''))
+            err_code = result.get('error_code', '')
+            last_err = f"{err_code} {desc}"
+            if 'parse' in desc.lower():
                 data['parse_mode'] = ''
                 files = {'photo': ('image.jpg', image_bytes, 'image/jpeg')}
                 continue
+            # Бот не админ / неверный чат — повторять бесполезно
+            if 'chat not found' in desc.lower() or 'forbidden' in desc.lower() or 'not enough rights' in desc.lower() or 'chat deactivated' in desc.lower():
+                logger.error(f"send_photo_to_telegram: Telegram отказал (chat={TELEGRAM_CHANNEL_ID}): {last_err}. Проверь, что бот — админ канала с правом 'Post Messages'.")
+                return False
+            logger.warning(f"send_photo {attempt+1}/3: {last_err}")
             time.sleep(5 * (attempt + 1))
         except Exception as e:
+            last_err = str(e)
             logger.error(f"send_photo {attempt+1}/3: {e}")
             time.sleep(5 * (attempt + 1))
+    logger.error(f"send_photo_to_telegram: не удалось после 3 попыток. Последняя ошибка: {last_err}")
     return False
 
 def send_message_to_admin(text, reply_markup=None):
@@ -597,7 +622,9 @@ def publish_horoscope(post_type='morning', force=False):
             content_hash = hash(text)
             save_posted(post_type, content_hash)
             LAST_POST_TIME = datetime.now()
+            logger.info(f"✅ Опубликован {post_type} гороскоп")
             return True
+        logger.error(f"❌ Не удалось опубликовать {post_type} — проверь права бота в канале {TELEGRAM_CHANNEL_ID}")
         return False
     except Exception as e:
         logger.error(f"publish_horoscope: {e}")

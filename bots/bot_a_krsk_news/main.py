@@ -91,16 +91,19 @@ LOG_FILE = os.environ.get('LOG_FILE', 'bot.log')
 PORT = int(os.environ.get('PORT', '8080'))
 
 # === RSS КРАСНОЯРСКА ===
+# Внимание: проверено 2026-10. Многие «канонические» URL-ы давно умерли
+# (ngs24.ru/rss/, sibnovosti.ru/rss/krasnoyarskiy-kray/, 1gorodskoi.ru, krsk.aif.ru, gtrk.ru/krsk/rss,
+#  newslab.ru/rss, 24rus.ru/rss, prokras.ru — последний вообще не про Красноярск, а про покраску дерева).
+# Ниже — реальные рабочие URL-ы на 2026-10.
 RSS_FEEDS = [
-    'https://ngs24.ru/rss/',
-    'https://ngs24.ru/rss/news/',
-    'https://www.gtrk.ru/krsk/rss/',
-    'https://newslab.ru/rss/',
-    'https://sibnovosti.ru/rss/krasnoyarskiy-kray/',
-    'https://1gorodskoi.ru/rss',
-    'https://prokras.ru/rss',
-    'https://krsk.aif.ru/rss',
+    'https://ngs24.ru/rss-feeds/rss.xml',         # НГС24 — главный городской портал (RSS по новому пути)
+    'https://krsk.sibnovosti.ru/rss',            # Сибновости — Красноярский край (301-redirect на sibnovosti.ru/rss/krasnoyarskiy-kray/)
+    'https://tass.ru/rss/v2.xml',                 # ТАСС — федеральный (ред. новости с тегом «Красноярск» проходят фильтр)
+    'https://ria.ru/export/rss2/archive/index.xml', # РИА Новости — федеральный (тоже ред. может пройти фильтр)
 ]
+
+# Если федеральный фид не содержит Красноярск-новостей — он просто не даст вклад в локальную выборку,
+# но это не критично, так как ngs24 + sibnovosti стабильно отдают ~15-30 новостей края в день.
 
 STRONG_KEYWORDS = [
     'красноярск', 'края', 'край', 'енесейск', 'енесей', 'сибирск',
@@ -208,9 +211,44 @@ def is_ai_related(article):
 
 def fetch_rss_entries():
     all_entries = []
+    feed_status = []  # для диагностики
     for feed_url in RSS_FEEDS:
         try:
-            feed = feedparser.parse(feed_url)
+            # feedparser по умолчанию не отправляет User-Agent и не работает с Cloudflare/DDoS-Guard.
+            # Скармливаем ему UA Chrome + Accept-encoding, чтобы ngs24/sibnovosti отдавали XML.
+            feed = feedparser.parse(
+                feed_url,
+                agent=(
+                    'Mozilla/5.0 (X11; Linux x86_64; rv:130.0) '
+                    'Gecko/20100101 Firefox/130.0'
+                ),
+                request_headers={
+                    'Accept': 'application/rss+xml, application/atom+xml, text/xml;q=0.9, */*;q=0.8',
+                    'Accept-Language': 'ru-RU,ru;q=0.9,en;q=0.5',
+                },
+            )
+            status = feed.get('status', 0)
+            n_entries = len(feed.entries)
+            feed_status.append(f"{feed_url} -> HTTP {status}, {n_entries} entries")
+            if n_entries == 0:
+                # Если фид вернул 0 — попробуем скачать raw и отдать feedparser уже строки
+                try:
+                    r = requests.get(
+                        feed_url,
+                        timeout=15,
+                        headers={
+                            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0',
+                            'Accept': 'application/rss+xml, application/atom+xml, text/xml;q=0.9, */*;q=0.8',
+                            'Accept-Language': 'ru-RU,ru;q=0.9',
+                        },
+                        proxies=get_proxies(),
+                    )
+                    if r.status_code == 200 and r.text.strip().startswith('<'):
+                        feed = feedparser.parse(r.text)
+                        n_entries = len(feed.entries)
+                        feed_status[-1] = f"{feed_url} -> fallback HTTP {r.status_code}, {n_entries} entries"
+                except Exception as e_fallback:
+                    feed_status[-1] = f"{feed_url} -> fallback failed: {e_fallback}"
             for entry in feed.entries[:15]:
                 image_url = extract_image_from_entry(entry)
                 all_entries.append({
@@ -220,10 +258,18 @@ def fetch_rss_entries():
                     'published': getattr(entry, 'published', ''),
                     'source': feed_url,
                     'image_url': image_url,
+                    '_entry': entry,  # сохраняем entry целиком для image_picker
                 })
         except Exception as e:
             logger.error(f"Парсинг {feed_url}: {e}")
-    logger.info(f"📦 Всего статей: {len(all_entries)}")
+            feed_status.append(f"{feed_url} -> ERROR: {e}")
+    # Диагностика: если собрано 0 — сообщим админу, что все фиды сломались
+    if not all_entries:
+        logger.error(f"⚠️ Все RSS-фиды пустые! Детали:\n  " + "\n  ".join(feed_status))
+    else:
+        logger.info(f"📦 Всего статей: {len(all_entries)} (из {len(RSS_FEEDS)} фидов)")
+        for line in feed_status:
+            logger.info(f"  • {line}")
     return all_entries
 
 def extract_image_from_entry(entry):
@@ -410,47 +456,69 @@ def get_post_images(article, max_count=4):
 
 def send_to_telegram(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHANNEL_ID:
+        logger.error("send_to_telegram: нет TELEGRAM_BOT_TOKEN или TELEGRAM_CHANNEL_ID")
         return False
     if len(text) > 4096:
         text = text[:4090] + '...'
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {'chat_id': TELEGRAM_CHANNEL_ID, 'text': text, 'parse_mode': 'HTML', 'disable_web_page_preview': False}
+    last_err = ''
     for attempt in range(3):
         try:
             r = requests.post(url, json=payload, timeout=30, proxies=get_proxies())
             data = r.json()
             if data.get('ok'):
                 return True
-            if 'parse' in str(data.get('description', '')).lower():
+            desc = str(data.get('description', ''))
+            err_code = data.get('error_code', '')
+            last_err = f"{err_code} {desc}"
+            if 'parse' in desc.lower() or 'can\'t find end of' in desc.lower() or 'tag' in desc.lower():
                 payload['parse_mode'] = ''
                 continue
+            if 'chat not found' in desc.lower() or 'forbidden' in desc.lower() or 'not enough rights' in desc.lower() or 'chat deactivated' in desc.lower():
+                logger.error(f"send_to_telegram: Telegram отказал (chat={TELEGRAM_CHANNEL_ID}): {last_err}. Бот не админ в канале или неверный channel_id.")
+                return False
+            logger.warning(f"send_to_telegram {attempt+1}/3: {last_err}")
             time.sleep(5 * (attempt + 1))
         except Exception as e:
+            last_err = str(e)
             logger.error(f"send {attempt+1}/3: {e}")
             time.sleep(5 * (attempt + 1))
+    logger.error(f"send_to_telegram: не удалось после 3 попыток. Последняя ошибка: {last_err}")
     return False
 
 def send_photo_to_telegram(image_bytes, caption):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHANNEL_ID:
+        logger.error("send_photo_to_telegram: нет TELEGRAM_BOT_TOKEN или TELEGRAM_CHANNEL_ID")
         return False
     caption = caption[:1020] + '...' if len(caption) > 1024 else caption
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     files = {'photo': ('image.jpg', image_bytes, 'image/jpeg')}
     data = {'chat_id': TELEGRAM_CHANNEL_ID, 'caption': caption, 'parse_mode': 'HTML'}
+    last_err = ''
     for attempt in range(3):
         try:
             r = requests.post(url, files=files, data=data, timeout=90, proxies=get_proxies())
             result = r.json()
             if result.get('ok'):
                 return True
-            if 'parse' in str(result.get('description', '')).lower():
+            desc = str(result.get('description', ''))
+            err_code = result.get('error_code', '')
+            last_err = f"{err_code} {desc}"
+            if 'parse' in desc.lower():
                 data['parse_mode'] = ''
                 files = {'photo': ('image.jpg', image_bytes, 'image/jpeg')}
                 continue
+            if 'chat not found' in desc.lower() or 'forbidden' in desc.lower() or 'not enough rights' in desc.lower() or 'chat deactivated' in desc.lower():
+                logger.error(f"send_photo_to_telegram: Telegram отказал (chat={TELEGRAM_CHANNEL_ID}): {last_err}. Проверь, что бот — админ канала с правом 'Post Messages'.")
+                return False
+            logger.warning(f"send_photo {attempt+1}/3: {last_err}")
             time.sleep(5 * (attempt + 1))
         except Exception as e:
+            last_err = str(e)
             logger.error(f"send_photo {attempt+1}/3: {e}")
             time.sleep(5 * (attempt + 1))
+    logger.error(f"send_photo_to_telegram: не удалось после 3 попыток. Последняя ошибка: {last_err}")
     return False
 
 def send_message_to_admin(text, reply_markup=None):
