@@ -368,11 +368,9 @@ def format_without_ai(article):
 # === КАРТИНКИ ===
 
 def generate_image_url(prompt, seed=None):
-    if seed is None:
-        seed = random.randint(1, 999999999)
-    styled = f"{prompt}, professional photograph, modern office, clean, no text overlay, no watermark"
-    encoded = urllib.parse.quote(styled, safe='')
-    return f"https://image.pollinations.ai/prompt/{encoded}?width={IMAGE_WIDTH}&height={IMAGE_HEIGHT}&nologo=true&seed={seed}&model=flux"
+    """DEPRECATED — pollinations.ai перестал быть бесплатным (402 Payment Required).
+    Возвращает None — генерация отключена."""
+    return None
 
 def download_image_bytes(url, timeout=90):
     try:
@@ -384,20 +382,13 @@ def download_image_bytes(url, timeout=90):
         return None
 
 def get_post_image(article):
+    """Для вакансий картинки обычно нет в источнике, и генерация отключена.
+    Пробуем взять из image_url (если вдруг есть), иначе возвращаем None.
+    """
     if not ENABLE_IMAGES:
         return None
-    # Для вакансий — обычно нет картинок в RSS, генерируем всегда
-    if IMAGE_SOURCE in ('article', 'both') and article.get('image_url'):
+    if article.get('image_url'):
         img = download_image_bytes(article['image_url'])
-        if img:
-            return img
-    if IMAGE_SOURCE in ('generated', 'both'):
-        prompt = article.get('_image_prompt', '').strip()
-        if not prompt:
-            cat = article.get('category', 'office work')
-            prompt = f"{cat} professional workplace, modern, clean"
-        url = generate_image_url(prompt)
-        img = download_image_bytes(url, timeout=120)
         if img:
             return img
     return None

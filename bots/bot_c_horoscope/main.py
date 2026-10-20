@@ -417,11 +417,9 @@ def format_fallback_horoscope(post_type):
 # === КАРТИНКИ ===
 
 def generate_image_url(prompt, seed=None):
-    if seed is None:
-        seed = random.randint(1, 999999999)
-    styled = f"{prompt}, mystical art, ethereal, gold accents, deep colors, professional digital art, no text overlay, no watermark"
-    encoded = urllib.parse.quote(styled, safe='')
-    return f"https://image.pollinations.ai/prompt/{encoded}?width={IMAGE_WIDTH}&height={IMAGE_HEIGHT}&nologo=true&seed={seed}&model=flux"
+    """DEPRECATED — pollinations.ai перестал быть бесплатным (402 Payment Required).
+    Возвращает None — генерация отключена."""
+    return None
 
 def download_image_bytes(url, timeout=120):
     try:
@@ -433,12 +431,10 @@ def download_image_bytes(url, timeout=120):
         return None
 
 def get_post_image(image_prompt):
-    if not ENABLE_IMAGES:
-        return None
-    if not image_prompt:
-        image_prompt = "mystic astrology, zodiac wheel, gold and deep blue, ethereal"
-    url = generate_image_url(image_prompt)
-    return download_image_bytes(url, timeout=120)
+    """Гороскопы не имеют источника картинок — генерация отключена, всегда None.
+    Бот будет постить только текст гороскопа.
+    """
+    return None
 
 # === TELEGRAM ===
 

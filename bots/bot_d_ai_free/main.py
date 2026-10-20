@@ -63,6 +63,7 @@ load_env_file()
 
 import feedparser
 import requests
+import image_picker  # ← общий модуль подбора картинок
 
 # === CONFIG ===
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
@@ -399,11 +400,9 @@ def format_without_ai(article):
     return f"🎁 {title}\n\n{summary}\n\n🔗 {link}\n\n#AIхалява #БесплатныеНейросети"
 
 def generate_image_url(prompt, seed=None):
-    if seed is None:
-        seed = random.randint(1, 999999999)
-    styled = f"{prompt}, modern tech design, emerald green accents, professional, clean, no text overlay, no watermark"
-    encoded = urllib.parse.quote(styled, safe='')
-    return f"https://image.pollinations.ai/prompt/{encoded}?width={IMAGE_WIDTH}&height={IMAGE_HEIGHT}&nologo=true&seed={seed}&model=flux"
+    """DEPRECATED — pollinations.ai перестал быть бесплатным (402 Payment Required).
+    Возвращает None — генерация отключена."""
+    return None
 
 def download_image_bytes(url, timeout=90):
     try:
@@ -415,22 +414,22 @@ def download_image_bytes(url, timeout=90):
         return None
 
 def get_post_image(article):
+    """Возвращает ОДНУ картинку (bytes) для прямой публикации без preview.
+    Использует image_picker — берёт картинки из статьи (RSS, og:image),
+    БЕЗ генерации через pollinations.ai.
+    """
     if not ENABLE_IMAGES:
         return None
-    if IMAGE_SOURCE in ('article', 'both'):
-        if article.get('image_url'):
-            img = download_image_bytes(article['image_url'])
-            if img:
-                return img
-    if IMAGE_SOURCE in ('generated', 'both'):
-        prompt = article.get('_image_prompt', '').strip()
-        if not prompt:
-            prompt = "gift box with neural network pattern, modern tech design, emerald green"
-        url = generate_image_url(prompt)
-        img = download_image_bytes(url, timeout=120)
-        if img:
-            return img
+    images = image_picker.pick_images_for_article(article, max_count=1)
+    if images:
+        return images[0][1]
     return None
+
+def get_post_images(article, max_count=4):
+    """Возвращает СПИСОК картинок [(url, bytes), ...] для preview с inline-кнопками."""
+    if not ENABLE_IMAGES:
+        return []
+    return image_picker.pick_images_for_article(article, max_count=max_count)
 
 def send_to_telegram(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHANNEL_ID:
@@ -588,6 +587,201 @@ def handle_callback(callback):
     elif data == 'skip':
         global SKIP_NEXT_POST
         SKIP_NEXT_POST = True
+    elif data.startswith('pv_pub:'):
+        post_id = data.split(':', 1)[1]
+        publish_from_preview(post_id, use_image=True)
+    elif data.startswith('pv_noimg:'):
+        post_id = data.split(':', 1)[1]
+        publish_from_preview(post_id, use_image=False)
+    elif data.startswith('pv_next:'):
+        post_id = data.split(':', 1)[1]
+        change_preview_image(post_id, +1)
+    elif data.startswith('pv_prev:'):
+        post_id = data.split(':', 1)[1]
+        change_preview_image(post_id, -1)
+    elif data.startswith('pv_skip:'):
+        post_id = data.split(':', 1)[1]
+        skip_from_preview(post_id)
+    elif data.startswith('pv_noop:'):
+        pass  # кнопка-индикатор "1/4"
+
+# === PREVIEW WITH IMAGE PICKER ===
+# In-memory storage для отложенных на предпросмотр постов
+PENDING_PREVIEW: Dict[str, dict] = {}
+
+def send_preview_to_admin(article, text, images):
+    """Отправляет админу пост + первую картинку (если есть) с inline-кнопками."""
+    post_id = str(int(time.time() * 1000))
+    PENDING_PREVIEW[post_id] = {
+        'article': article,
+        'text': text,
+        'images': images,
+        'current_idx': 0,
+        'created_at': time.time(),
+    }
+    _cleanup_stale_preview()
+
+    keyboard = build_preview_keyboard(post_id, len(images))
+    caption = text[:1024]
+    if len(text) > 1024:
+        caption += '...'
+
+    if images:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+        files = {'photo': ('img.jpg', images[0][1], 'image/jpeg')}
+        data = {
+            'chat_id': ADMIN_USER_ID,
+            'caption': caption,
+            'parse_mode': 'HTML',
+            'reply_markup': json.dumps(keyboard),
+        }
+        try:
+            r = requests.post(url, files=files, data=data, timeout=60, proxies=get_proxies())
+            result = r.json()
+            if result.get('ok'):
+                PENDING_PREVIEW[post_id]['message_id'] = result['result']['message_id']
+                logger.info(f"👁️ Preview отправлен, post_id={post_id}, картинок={len(images)}")
+                return True
+            logger.error(f"Preview send error: {result}")
+        except Exception as e:
+            logger.error(f"Preview send: {e}")
+        return False
+    else:
+        full_text = caption + "\n\n_(нет подходящих картинок)_"
+        return send_message_to_admin(full_text, reply_markup=keyboard)
+
+def build_preview_keyboard(post_id, total_images):
+    """Строит inline-клавиатуру для preview-поста."""
+    rows = []
+    if total_images > 1:
+        rows.append([
+            {'text': '◀️ Пред. картинка', 'callback_data': f'pv_prev:{post_id}'},
+            {'text': f'1/{total_images}', 'callback_data': f'pv_noop:{post_id}'},
+            {'text': 'След. картинка ▶️', 'callback_data': f'pv_next:{post_id}'},
+        ])
+    rows.append([
+        {'text': '✅ Опубликовать', 'callback_data': f'pv_pub:{post_id}'},
+    ])
+    if total_images > 0:
+        rows.append([
+            {'text': '🚫 Без картинки', 'callback_data': f'pv_noimg:{post_id}'},
+        ])
+    rows.append([
+        {'text': '⏭️ Пропустить пост', 'callback_data': f'pv_skip:{post_id}'},
+    ])
+    return {'inline_keyboard': rows}
+
+def _cleanup_stale_preview():
+    """Удаляет preview-посты старше 1 часа."""
+    now = time.time()
+    stale = [pid for pid, p in PENDING_PREVIEW.items()
+             if now - p.get('created_at', 0) > 3600]
+    for pid in stale:
+        PENDING_PREVIEW.pop(pid, None)
+
+def change_preview_image(post_id, direction):
+    """Меняет картинку в предпросмотре (editMessageMedia). direction: -1 или +1."""
+    p = PENDING_PREVIEW.get(post_id)
+    if not p:
+        return False
+    images = p['images']
+    if len(images) <= 1:
+        return False
+
+    p['current_idx'] = (p['current_idx'] + direction) % len(images)
+    new_idx = p['current_idx']
+    new_bytes = images[new_idx][1]
+    msg_id = p.get('message_id')
+    if not msg_id:
+        return False
+
+    caption_text = p['text'][:1024]
+    if len(p['text']) > 1024:
+        caption_text += '...'
+
+    keyboard = build_preview_keyboard(post_id, len(images))
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageMedia"
+    media_payload = {
+        'type': 'photo',
+        'media': 'attach://photo',
+        'caption': caption_text,
+        'parse_mode': 'HTML',
+    }
+    files = {
+        'media': (None, json.dumps(media_payload), 'application/json'),
+        'photo': ('img.jpg', new_bytes, 'image/jpeg'),
+    }
+    data = {
+        'chat_id': ADMIN_USER_ID,
+        'message_id': msg_id,
+        'reply_markup': json.dumps(keyboard),
+    }
+    try:
+        r = requests.post(url, files=files, data=data, timeout=60, proxies=get_proxies())
+        result = r.json()
+        if result.get('ok'):
+            logger.info(f"🔄 Картинка сменена на {new_idx+1}/{len(images)} (post_id={post_id})")
+            return True
+        logger.warning(f"editMessageMedia: {result}")
+    except Exception as e:
+        logger.error(f"change_preview_image: {e}")
+    return False
+
+def publish_from_preview(post_id, use_image=True, image_idx=None):
+    """Публикует пост из preview в канал."""
+    p = PENDING_PREVIEW.get(post_id)
+    if not p:
+        send_message_to_admin(f"⚠️ Preview {post_id} не найден (устарел?)")
+        return False
+    article = p['article']
+    text = p['text']
+    images = p['images']
+
+    if use_image and images:
+        idx = image_idx if image_idx is not None else p['current_idx']
+        idx = idx % len(images)
+        img_bytes = images[idx][1]
+        success = send_photo_to_telegram(img_bytes, text)
+        if not success:
+            logger.warning("sendPhoto failed, fallback to text")
+            success = send_to_telegram(text)
+    else:
+        success = send_to_telegram(text)
+
+    if success:
+        save_posted_url(article.get('link', ''), article.get('title', ''))
+        global LAST_POST_TIME
+        LAST_POST_TIME = datetime.now()
+        msg_id = p.get('message_id')
+        if msg_id:
+            try:
+                url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteMessage"
+                requests.post(url, json={'chat_id': ADMIN_USER_ID, 'message_id': msg_id},
+                              timeout=10, proxies=get_proxies())
+            except Exception:
+                pass
+        send_message_to_admin(f"✅ Опубликовано: {article.get('title', '')[:60]}")
+        PENDING_PREVIEW.pop(post_id, None)
+        return True
+    send_message_to_admin(f"❌ Ошибка публикации: {article.get('title', '')[:60]}")
+    return False
+
+def skip_from_preview(post_id):
+    """Пропускает пост из preview."""
+    p = PENDING_PREVIEW.pop(post_id, None)
+    if not p:
+        return False
+    msg_id = p.get('message_id')
+    if msg_id:
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteMessage"
+            requests.post(url, json={'chat_id': ADMIN_USER_ID, 'message_id': msg_id},
+                          timeout=10, proxies=get_proxies())
+        except Exception:
+            pass
+    send_message_to_admin("⏭️ Пост пропущен")
+    return True
 
 LAST_POST_TIME = None
 BOT_START_TIME = datetime.now()
@@ -624,6 +818,14 @@ def publish_next_post(force=False):
         text = make_summary(article)
         if not text:
             return False
+
+        # Если включён preview И есть admin — отправляем превью с кнопками смены картинки
+        if ENABLE_PREVIEW and ADMIN_USER_ID and not force:
+            images = get_post_images(article, max_count=4)
+            logger.info(f"🖼️ Найдено картинок для preview: {len(images)}")
+            return send_preview_to_admin(article, text, images)
+
+        # Иначе (force=True или preview выключен) — публикуем сразу
         image_bytes = get_post_image(article)
         if image_bytes:
             success = send_photo_to_telegram(image_bytes, text)
